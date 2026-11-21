@@ -1,0 +1,12 @@
+# Hackathon sample data
+sample/
+blast-radius-sample.tar.gz
+
+# Generated output
+output.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
