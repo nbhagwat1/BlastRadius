@@ -240,7 +240,7 @@ def arg_flip_tests(coverage: dict, path: str, deleted: list, added: list) -> lis
 
 
 def same_comparison(old: str, new: str) -> bool:
-    """`is None` <-> `== None` and `is X.MEMBER` <-> `== X.MEMBER` (or the negated forms): the same test either way."""
+    """`is None` <-> `== None` and `is X.MEMBER` -> `== X.MEMBER` (or the negated forms): the same test either way."""
     before = [re.sub(r"\s+", " ", token) for token in TOKEN.findall(old)]
     after = [re.sub(r"\s+", " ", token) for token in TOKEN.findall(new)]
     if before == after or len(before) != len(after):
@@ -255,8 +255,9 @@ def same_comparison(old: str, new: str) -> bool:
         if operand == ["None"]:
             j += 1
         else:
-            # A dotted enum member: Name(.name)*.UPPER_CASE
-            if j >= len(before) or not before[j][:1].isupper():
+            # A dotted enum member: Name(.name)*.UPPER_CASE. Only identity -> equality: a str-valued
+            # enum compared by == can match a raw string, which `is` would then reject.
+            if a not in ("is", "is not") or j >= len(before) or not before[j][:1].isupper():
                 return False
             j += 1
             while j + 1 < len(before) and before[j] == ".":
