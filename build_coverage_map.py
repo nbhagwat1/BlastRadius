@@ -219,7 +219,7 @@ def build_map() -> None:
                 else:
                     tests |= found
 
-            if outside_tests and not tests:
+            if outside_tests:
                 value = IMPORT
                 counts["import"] += 1
             elif not tests:
@@ -266,6 +266,9 @@ def build_map() -> None:
         all_tests: set[str] = set()
         for path in paths:
             all_tests |= tests_in_file(files[path])
+        # Include tests from the matching test file (tests/dialects/test_<dialect>.py).
+        test_prefix = f"tests/dialects/test_{dialect}.py::"
+        all_tests |= {t for t in test_index if t.startswith(test_prefix)}
         if all_tests:
             sn = set_number(all_tests)
             for path in paths:
