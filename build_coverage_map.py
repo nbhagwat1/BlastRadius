@@ -473,8 +473,9 @@ def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
 
 
 def attr_reads(payload: dict, set_number) -> dict[str, list[list[int]]]:
-    """Dialect file -> [first line, last line, tests] of each import-time assignment whose name is
-    only read by code that runs inside tests: the family's tests that run one of those reads.
+    """File -> [first line, last line, tests] of each import-time assignment whose name is only
+    read by code that runs inside tests: the tests that run one of those reads (within the
+    dialect's family, for a dialect file). Expression classes are left to arg_flips.
 
     Another class defining the same name is not a read. Any import-time read (a metaclass
     deriving a table, a subclass extending it, code run while collecting) leaves the
@@ -491,7 +492,8 @@ def attr_reads(payload: dict, set_number) -> dict[str, list[list[int]]]:
     def tests_reading(name: str, own: str, first: int, last: int) -> set[int] | None:
         definition = re.compile(r"^\s*" + re.escape(name) + r"\s*(:[^=]+)?=(?!=)(.*)$")
         word = re.compile(r"\b" + re.escape(name) + r"\b")
-        found: set[int] = set()
+        named = payload["word_tests"].get(name.upper())
+        found: set[int] = set() if named is None else set(payload["sets"][named])
         for path, number in occurrences.get(name, ()):
             line = sources[path][number - 1]
             if (path == own and first <= number <= last) or not word.search(line):
@@ -507,8 +509,10 @@ def attr_reads(payload: dict, set_number) -> dict[str, list[list[int]]]:
         return found
 
     spans: dict[str, list[list[int]]] = {}
-    for path, family in payload["families"].items():
-        lines = payload["files"].get(path, {})
+    for path, lines in payload["files"].items():
+        if path.startswith("sqlglot/expressions/") or path not in sources:
+            continue
+        family = payload["families"].get(path)
         for node in ast.walk(ast.parse("\n".join(sources[path]))):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or lines.get(str(node.lineno)) != IMPORT:
                 continue
@@ -517,7 +521,7 @@ def attr_reads(payload: dict, set_number) -> dict[str, list[list[int]]]:
                 continue
             found = tests_reading(targets[0].id, path, node.lineno, node.end_lineno)
             if found is not None:
-                tests = set(payload["sets"][family]) & found
+                tests = found if family is None else set(payload["sets"][family]) & found
                 spans.setdefault(path, []).append([node.lineno, node.end_lineno, set_number(tests)])
     return spans
 
