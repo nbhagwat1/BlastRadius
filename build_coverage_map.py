@@ -414,6 +414,84 @@ def add_selection_tables() -> None:
           f"sets: {len(sets)}, size: {OUT.stat().st_size} bytes", file=sys.stderr)
 
 
+def func_flip_tests(payload: dict, sources: dict[str, str], path: str, first: int, last: int, family: set[str]) -> set[int] | None:
+    """A Func is also built by its SQL names (parser FUNCTIONS, exp.func) and validated there, so
+    besides every line naming the class it reaches lines quoting a SQL name and every test file or
+    fixture spelling one. None when an import-time reference cannot be narrowed."""
+    import selector
+
+    sys.path.insert(0, str(REPO))
+    from sqlglot import exp
+
+    sql_names: set[str] = set()
+    for name in family:
+        cls = getattr(exp, name, None)
+        if isinstance(cls, type) and issubclass(cls, exp.Func):
+            try:
+                sql_names |= {n.upper() for n in cls.sql_names()}
+            except NotImplementedError:
+                pass  # abstract: its concrete subclasses are in the family
+    words = sql_names | {name.upper() for name in family}
+
+    found: set[int] = set()
+    for test_file, tests in _test_files(payload).items():
+        if any(set(WORD.findall(word)) <= tests[0] for word in words):
+            found |= tests[1]
+    if "fixtures" not in _cache:
+        _cache["fixtures"] = [(set(WORD.findall((REPO / f).read_text(encoding="utf-8", errors="replace").upper())), set(payload["sets"][v]))
+                              for f, v in payload["fixtures"].items() if v >= 0]
+    for text_words, readers in _cache["fixtures"]:
+        if any(set(WORD.findall(word)) <= text_words for word in words):
+            found |= readers
+
+    class_names = re.compile(r"\b(" + "|".join(sorted(map(re.escape, family))) + r")\b")
+    quoted = re.compile(r"[\"'](" + "|".join(sorted(map(re.escape, sql_names))) + r")[\"']", re.I) if sql_names else None
+    headers = _class_headers(sources)
+    try:
+        for source_path, source in sources.items():
+            lines = payload["files"].get(source_path, {})
+            for number, line in enumerate(source.split("\n"), 1):
+                if (source_path, number) in headers or (source_path == path and first <= number <= last):
+                    continue
+                if not (class_names.search(line) or (quoted and quoted.search(line))):
+                    continue
+                value = lines.get(str(number))
+                if value == IMPORT:
+                    found |= set(selector.import_tests(payload, source_path, number, [line]))
+                elif value is not None and value >= 0:
+                    found |= set(payload["sets"][value])
+    except selector.Unmapped:
+        return None
+    return found
+
+
+_cache: dict[str, object] = {}
+
+
+def _test_files(payload: dict) -> dict[str, tuple[set[str], set[int]]]:
+    """Test file -> (upper-cased words anywhere in it, its tests), so module-level SQL counts too."""
+    if "test_files" not in _cache:
+        files: dict[str, tuple[set[str], set[int]]] = {}
+        for index, test_id in enumerate(payload["tests"]):
+            file = test_id.split("::")[0]
+            if file not in files:
+                files[file] = (set(WORD.findall((REPO / file).read_text(encoding="utf-8").upper())), set())
+            files[file][1].add(index)
+        _cache["test_files"] = files
+    return _cache["test_files"]
+
+
+def _class_headers(sources: dict[str, str]) -> set[tuple[str, int]]:
+    if "headers" not in _cache:
+        headers = set()
+        for path, source in sources.items():
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.ClassDef) and node.body:
+                    headers.update((path, n) for n in range(node.lineno, node.body[0].lineno))
+        _cache["headers"] = headers
+    return _cache["headers"]
+
+
 def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
     """expressions file -> [first line, last line, tests] of each non-Func class's arg_types dict.
 
@@ -451,6 +529,9 @@ def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
     for path, first, last, name in spans:
         family = {c for c in bases if c == name or name in ancestors(c)}
         if any(c == "Func" or "Func" in ancestors(c) for c in family):
+            found = func_flip_tests(payload, sources, path, first, last, family)
+            if found is not None:
+                flips.setdefault(path, []).append([first, last, set_number(found)])
             continue
         mentions = re.compile(r"\b(" + "|".join(sorted(map(re.escape, family))) + r")\b")
         found: set[int] = set()
