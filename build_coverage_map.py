@@ -405,9 +405,71 @@ def add_selection_tables() -> None:
                     found |= readers
         payload["families"][path] = set_number(found)
 
+    payload["arg_flips"] = arg_flips(payload, set_number)
+
     OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
-    print(f"words: {len(payload['word_tests'])}, families: {len(payload['families'])}, "
+    print(f"arg_types spans: {sum(map(len, payload['arg_flips'].values()))}, "
+          f"words: {len(payload['word_tests'])}, families: {len(payload['families'])}, "
           f"sets: {len(sets)}, size: {OUT.stat().st_size} bytes", file=sys.stderr)
+
+
+def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
+    """expressions file -> [first line, last line, tests] of each non-Func class's arg_types dict.
+
+    Flipping one of its True/False values only changes the class's required_args, which only the
+    parser's validate_expression reads. So it reaches the tests running parser code that names the
+    class or a subclass; a Func is also built and validated by name, so it gets no entry.
+    """
+    import selector
+
+    sources = {p.relative_to(REPO).as_posix(): p.read_text(encoding="utf-8") for p in sorted((REPO / "sqlglot").rglob("*.py"))}
+    bases: dict[str, set[str]] = {}
+    spans = []
+    for path, source in sources.items():
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases.setdefault(node.name, set()).update(b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for b in node.bases)
+            if path.startswith("sqlglot/expressions/"):
+                for statement in node.body:
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [getattr(statement, "target", None)]
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign)) and any(getattr(t, "id", "") == "arg_types" for t in targets):
+                        spans.append((path, statement.lineno, statement.end_lineno, node.name))
+
+    def ancestors(name: str) -> set[str]:
+        found, todo = set(), [name]
+        while todo:
+            for base in bases.get(todo.pop(), ()):
+                if base not in found:
+                    found.add(base)
+                    todo.append(base)
+        return found
+
+    parser_files = re.compile(r"sqlglot/(parser\.py|parsers/\w+\.py|dialects/\w+\.py)$")
+    flips: dict[str, list[list[int]]] = {}
+    for path, first, last, name in spans:
+        family = {c for c in bases if c == name or name in ancestors(c)}
+        if any(c == "Func" or "Func" in ancestors(c) for c in family):
+            continue
+        mentions = re.compile(r"\b(" + "|".join(sorted(map(re.escape, family))) + r")\b")
+        own = payload["file_tests"].get(path)
+        found = set() if own is None else set(payload["sets"][own])
+        try:
+            for parser_path, source in sources.items():
+                if not parser_files.match(parser_path):
+                    continue
+                lines = payload["files"].get(parser_path, {})
+                for number, line in enumerate(source.split("\n"), 1):
+                    if mentions.search(line):
+                        value = lines.get(str(number))
+                        if value == IMPORT:
+                            found |= set(selector.import_tests(payload, parser_path, number, [line]))
+                        elif value is not None and value >= 0:
+                            found |= set(payload["sets"][value])
+        except selector.Unmapped:
+            continue
+        flips.setdefault(path, []).append([first, last, set_number(found)])
+    return flips
 
 
 def write_sources() -> None:

@@ -18,6 +18,7 @@ WORKER_OVERHEAD_MS = 2000
 MISSING, IMPORT = -1, -2
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 QUOTED = re.compile(r'"([^"\\]{2,})"')
+BOOL = re.compile(r"\b(True|False)\b")
 WORD = re.compile(r"[A-Z0-9_]+")
 OTHER_CHANGES = ("rename ", "copy ", "new file", "deleted file", "old mode", "new mode", "Binary files", "GIT binary patch")
 
@@ -222,6 +223,19 @@ def import_tests(coverage: dict, path: str, number: int, texts: list[str]) -> li
     raise Unmapped(f"{path}:{number} runs at import time or outside a test")
 
 
+def arg_flip_tests(coverage: dict, path: str, deleted: list, added: list) -> list[int] | None:
+    """Tests a one-line True/False flip inside a non-Func class's arg_types can affect; None for any other block."""
+    if len(deleted) != 1 or len(added) != 1:
+        return None
+    (number, old), new = deleted[0], added[0]
+    if old == new or BOOL.sub("B", old) != BOOL.sub("B", new):
+        return None
+    for first, last, tests in coverage.get("arg_flips", {}).get(path, ()):
+        if first <= number <= last:
+            return coverage["sets"][tests]
+    return None
+
+
 def tests_at(coverage: dict, path: str, number: int, texts: list[str]) -> list[int] | set[int]:
     value = coverage["files"][path].get(str(number))
     if value is None:
@@ -270,6 +284,10 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
         for start, deleted, added in changed["blocks"]:
             # A block that only touches comments and blank lines changes no behaviour.
             if all(is_blank_or_comment(content) for _, content in deleted) and all(map(is_blank_or_comment, added)):
+                continue
+            flipped = arg_flip_tests(coverage, path, deleted, added)
+            if flipped is not None:
+                selected.update(flipped)
                 continue
             texts = [content for _, content in deleted] + added
             deleted_code = False
