@@ -139,6 +139,12 @@ def tests_at(coverage: dict, path: str, number: int) -> list[int]:
         if fallback is not None:
             return coverage["sets"][fallback]
         raise Unmapped(f"{path}:{number} has no test coverage and no module group")
+    for start, end in coverage.get("widen_to_group", {}).get(path, ()):
+        if start <= number <= end:
+            group = coverage.get("module_groups", {}).get(path)
+            if group is not None:
+                return coverage["sets"][group]
+            break
     return coverage["sets"][value]
 
 

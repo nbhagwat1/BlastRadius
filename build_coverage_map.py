@@ -281,6 +281,24 @@ def build_map() -> None:
         if ft:
             file_tests[path] = set_number(ft)
 
+    # Functions using importlib.import_module() may be under-recorded: the coverage build
+    # eagerly imports all modules, so lazy loaders like _try_load are only called by the
+    # few tests that explicitly test lazy loading.  Widen their tested lines to the module group.
+    widen_to_group: dict[str, list[list[int]]] = {}
+    for path in files:
+        if path not in module_groups:
+            continue
+        source = (REPO / path).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for child in ast.walk(node):
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "import_module"):
+                    widen_to_group.setdefault(path, []).append([node.body[0].lineno, node.end_lineno])
+                    break
+
     payload = {
         "tests": sorted(test_index, key=test_index.__getitem__),
         "sets": [list(key) for key in sorted(set_index, key=set_index.__getitem__)],
@@ -288,6 +306,7 @@ def build_map() -> None:
         "fixtures": fixtures,
         "module_groups": module_groups,
         "file_tests": file_tests,
+        "widen_to_group": widen_to_group,
     }
     OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
 
