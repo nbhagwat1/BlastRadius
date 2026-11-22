@@ -4,4 +4,5 @@
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 COPY selector.py /app/selector.py
 COPY coverage_map.json.gz /app/coverage_map.json.gz
+COPY sqlglot_source.json.gz /app/sqlglot_source.json.gz
 CMD ["python", "/app/selector.py"]

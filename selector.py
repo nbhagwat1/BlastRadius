@@ -7,10 +7,12 @@ import gzip
 import json
 import re
 import sys
+import warnings
 from pathlib import Path
 
 DATA = Path("/data")
 MAP_FILE = Path(__file__).resolve().parent / "coverage_map.json.gz"
+SOURCE_FILE = Path(__file__).resolve().parent / "sqlglot_source.json.gz"
 WORKERS = 4
 MISSING, IMPORT = -1, -2
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -120,6 +122,45 @@ def parse_patch(text: str) -> list[dict]:
     return files
 
 
+_sources: dict[str, str] | None = None
+
+
+def pinned_source(path: str) -> str:
+    global _sources
+    if _sources is None:
+        try:
+            _sources = json.loads(gzip.decompress(SOURCE_FILE.read_bytes()))
+        except (OSError, ValueError) as error:
+            raise Unmapped(f"no pinned source to compile against ({error})")
+    if path not in _sources:
+        raise Unmapped(f"{path} has no pinned source to compile against")
+    return _sources[path]
+
+
+def patched_source(path: str, blocks: list) -> str:
+    """The file after the patch, built from the pinned source; any disagreement with it is Unmapped."""
+    lines = pinned_source(path).split("\n")
+    for start, deleted, added in reversed(blocks):
+        if start < 1 or start - 1 + len(deleted) > len(lines):
+            raise Unmapped(f"{path}:{start} is past the end of the pinned source")
+        for offset, (number, content) in enumerate(deleted):
+            if number != start + offset or lines[number - 1] != content.rstrip("\r"):
+                raise Unmapped(f"{path}:{number} does not match the pinned source")
+        lines[start - 1 : start - 1 + len(deleted)] = [line.rstrip("\r") for line in added]
+    return "\n".join(lines)
+
+
+def check_compiles(path: str, blocks: list) -> None:
+    """A file that no longer compiles breaks every test that imports it, however indirectly."""
+    source = patched_source(path, blocks)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compile(source, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as error:
+        raise Unmapped(f"{path} does not compile after the patch: {error}")
+
+
 def is_blank_or_comment(text: str) -> bool:
     stripped = text.strip()
     return not stripped or stripped.startswith("#")
@@ -167,6 +208,7 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
             continue
         if path not in coverage["files"]:
             raise Unmapped(f"{path} is not in the coverage map")
+        check_compiles(path, changed["blocks"])
         lines = coverage["files"][path]
 
         for start, deleted, added in changed["blocks"]:

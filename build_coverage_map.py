@@ -29,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE / "sqlglot"
 TESTS_DIR = str(REPO / "tests") + os.sep
 OUT = HERE / "coverage_map.json.gz"
+SOURCE_OUT = HERE / "sqlglot_source.json.gz"
 DATA_FILE = "/tmp/blast-radius.coverage"
 READS_FILE = "/tmp/blast-radius-reads.json"
 MISSING, IMPORT = -1, -2
@@ -322,6 +323,18 @@ def build_map() -> None:
         print(f"fixture {relative}: {readers}", file=sys.stderr)
 
 
+def write_sources() -> None:
+    """The pinned commit's sqlglot/*.py, so the selector can compile a patched file without importing it."""
+    sources = {
+        # read_text's universal newlines turn a CRLF checkout back into the commit's LF lines.
+        path.relative_to(REPO).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted((REPO / "sqlglot").rglob("*.py"))
+    }
+    SOURCE_OUT.write_bytes(gzip.compress(json.dumps(sources, separators=(",", ":")).encode(), mtime=0))
+    print(f"sources: {len(sources)} files, size: {SOURCE_OUT.stat().st_size} bytes", file=sys.stderr)
+
+
 if __name__ == "__main__":
     run_tests()
     build_map()
+    write_sources()
