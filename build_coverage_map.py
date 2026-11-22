@@ -452,8 +452,7 @@ def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
         if any(c == "Func" or "Func" in ancestors(c) for c in family):
             continue
         mentions = re.compile(r"\b(" + "|".join(sorted(map(re.escape, family))) + r")\b")
-        own = payload["file_tests"].get(path)
-        found = set() if own is None else set(payload["sets"][own])
+        found: set[int] = set()
         try:
             for parser_path, source in sources.items():
                 if not parser_files.match(parser_path):
