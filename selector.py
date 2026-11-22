@@ -3,6 +3,7 @@
 Whenever the coverage map cannot answer for a change, the commit runs every test.
 """
 
+import ast
 import gzip
 import json
 import re
@@ -267,6 +268,44 @@ def same_comparison(old: str, new: str) -> bool:
     return True
 
 
+def scope_effects(text: str) -> set | None:
+    """What a statement does to its whole function, wherever it sits: the names it binds, its
+    global/nonlocal declarations, and whether it makes the function a generator or coroutine.
+    None when the line is not a statement on its own."""
+    source = text.strip()
+    if source.endswith(":"):
+        source += " pass"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    effects = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            effects.add(("bind", node.id))
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            effects.update(("declare", name) for name in node.names)
+        elif isinstance(node, ast.alias):
+            effects.add(("bind", (node.asname or node.name).split(".")[0]))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            effects.add(("bind", node.name))
+        elif isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await)):
+            effects.add(("kind", type(node).__name__))
+    return effects
+
+
+def same_shape(old: str, new: str) -> bool:
+    """The replacement cannot move other lines into or out of a block or statement, nor change its function's scope."""
+    indent = lambda text: text[: len(text) - len(text.lstrip())]
+    depth = lambda text: sum(text.count(c) for c in "([{") - sum(text.count(c) for c in ")]}")
+    ending = lambda text: text.rstrip()[-1:] in (":", "\\")
+    if (indent(old) != indent(new) or depth(old) != depth(new) or ending(old) != ending(new)
+            or any(q in old + new for q in ('"""', "'''"))):
+        return False
+    effects = scope_effects(old)
+    return effects is not None and effects == scope_effects(new)
+
+
 def tests_at(coverage: dict, path: str, number: int, texts: list[str]) -> list[int] | set[int]:
     value = coverage["files"][path].get(str(number))
     if value is None:
@@ -319,6 +358,12 @@ def tests_for_patch(text: str, coverage: dict) -> tuple[set[int], bool]:
                 continue
             if len(deleted) == len(added) and all(
                 content == new or same_comparison(content, new) for (_, content), new in zip(deleted, added)
+            ):
+                continue
+            # No test ever reaches a MISSING line, so rewriting one in place changes no test's run.
+            if len(deleted) == len(added) and all(
+                lines.get(str(number)) == MISSING and same_shape(content, new)
+                for (number, content), new in zip(deleted, added)
             ):
                 continue
             flipped = arg_flip_tests(coverage, path, deleted, added)
