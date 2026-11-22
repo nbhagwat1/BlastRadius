@@ -6,9 +6,10 @@ Run once from the repository root, inside the image the scorer uses:
         python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 \
         sh -c "pip install -q -r requirements.lock pytest-cov && python build_coverage_map.py"
 
-Map format: {"tests": [test ids], "sets": [[indexes into tests]], "files": {path: {line: value}}}.
-A line's value is an index into "sets", MISSING (no test ran it) or IMPORT (it runs at import
-time or outside any test). Lines that belong to no statement (blank, comment, docstring) are absent.
+Map format: {"tests": [test ids], "sets": [[indexes into tests]], "files": {path: {line: value}},
+"fixtures": {path: value}}. A line's value is an index into "sets", MISSING (no test ran it) or
+IMPORT (it runs at import time or outside any test). Lines that belong to no statement (blank,
+comment, docstring) are absent. "fixtures" lists the data files under tests/ that the tests opened.
 """
 
 import ast
@@ -21,12 +22,58 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE / "sqlglot"
+TESTS_DIR = str(REPO / "tests") + os.sep
 OUT = HERE / "coverage_map.json.gz"
 DATA_FILE = "/tmp/blast-radius.coverage"
+READS_FILE = "/tmp/blast-radius-reads.json"
 MISSING, IMPORT = -1, -2
 PHASES = ("setup", "run", "teardown")
+
+# Data files under tests/ that were opened -> contexts that opened them, in pytest-cov's
+# "<test id>|<phase>" form, or "" when no test was running.
+_current_context = ""
+_reads: dict[str, set[str]] = {}
+
+
+def _record_open(event, args):
+    if event != "open" or not isinstance(args[0], (str, os.PathLike)):
+        return
+    path = os.path.abspath(os.fspath(args[0]))
+    if path.startswith(TESTS_DIR) and not path.endswith((".py", ".pyc")):
+        relative = Path(path).relative_to(REPO).as_posix()
+        _reads.setdefault(relative, set()).add(_current_context)
+
+
+def _in_phase(item, phase):
+    global _current_context
+    _current_context = f"{item.nodeid}|{phase}"
+    try:
+        return (yield)
+    finally:
+        _current_context = ""
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
+    return (yield from _in_phase(item, "setup"))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    return (yield from _in_phase(item, "run"))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    return (yield from _in_phase(item, "teardown"))
+
+
+def pytest_unconfigure(config):
+    Path(READS_FILE).write_text(json.dumps({path: sorted(c) for path, c in _reads.items()}))
 
 
 class InProcessPool(concurrent.futures.Executor):
@@ -54,6 +101,7 @@ def pytest_configure(config):
     # TestOptimizer and TestExecutor send their sqlglot work to spawned processes, which
     # coverage would record without the test's context. Patch before test modules import it.
     concurrent.futures.ProcessPoolExecutor = InProcessPool
+    sys.addaudithook(_record_open)
 
 
 def pytest_collection_finish(session):
@@ -139,6 +187,10 @@ def build_map() -> None:
     files: dict[str, dict[str, int]] = {}
     counts = {"tested": 0, "missing": 0, "import": 0}
 
+    def set_number(tests: set[str]) -> int:
+        key = tuple(sorted(test_index.setdefault(t, len(test_index)) for t in sorted(tests)))
+        return set_index.setdefault(key, len(set_index))
+
     for measured in sorted(data.measured_files()):
         path = Path(measured).resolve()
         try:
@@ -173,17 +225,26 @@ def build_map() -> None:
                 value = MISSING
                 counts["missing"] += 1
             else:
-                key = tuple(sorted(test_index.setdefault(t, len(test_index)) for t in sorted(tests)))
-                value = set_index.setdefault(key, len(set_index))
+                value = set_number(tests)
                 counts["tested"] += 1
             for line in lines:
                 entries[str(line)] = value
         files[relative] = entries
 
+    # Data files under tests/: a file read outside any test is IMPORT, like import-time code.
+    fixtures: dict[str, int] = {}
+    for relative, contexts in sorted(json.loads(Path(READS_FILE).read_text()).items()):
+        found = [tests_for(context) for context in contexts]
+        if any(tests is None for tests in found):
+            fixtures[relative] = IMPORT
+        else:
+            fixtures[relative] = set_number(set().union(*found))
+
     payload = {
         "tests": sorted(test_index, key=test_index.__getitem__),
         "sets": [list(key) for key in sorted(set_index, key=set_index.__getitem__)],
         "files": files,
+        "fixtures": fixtures,
     }
     OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
 
@@ -194,6 +255,9 @@ def build_map() -> None:
     print(f"tests.json ids recorded: {len(expected & recorded)}/{len(expected)}", file=sys.stderr)
     for missing in sorted(expected - recorded):
         print(f"  not recorded: {missing}", file=sys.stderr)
+    for relative, value in fixtures.items():
+        readers = "read outside a test" if value == IMPORT else f"{len(payload['sets'][value])} tests"
+        print(f"fixture {relative}: {readers}", file=sys.stderr)
 
 
 if __name__ == "__main__":

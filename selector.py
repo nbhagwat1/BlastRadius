@@ -130,6 +130,12 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
         path = changed["new"]
         if changed["other"] or changed["old"] is None or changed["old"] != path:
             raise Unmapped(f"{changed['old']} -> {path} is added, deleted, renamed or a mode change")
+        fixture = coverage.get("fixtures", {}).get(path)
+        if fixture is not None:
+            if fixture < 0:
+                raise Unmapped(f"{path} is read outside a test")
+            selected.update(coverage["sets"][fixture])
+            continue
         if path not in coverage["files"]:
             raise Unmapped(f"{path} is not in the coverage map")
         lines = coverage["files"][path]
