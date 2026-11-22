@@ -13,9 +13,12 @@ from pathlib import Path
 DATA = Path("/data")
 MAP_FILE = Path(__file__).resolve().parent / "coverage_map.json.gz"
 SOURCE_FILE = Path(__file__).resolve().parent / "sqlglot_source.json.gz"
-WORKERS = 4
+MAX_WORKERS = 8
+WORKER_OVERHEAD_MS = 2000
 MISSING, IMPORT = -1, -2
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+QUOTED = re.compile(r'"([^"\\]{2,})"')
+WORD = re.compile(r"[A-Z0-9_]+")
 OTHER_CHANGES = ("rename ", "copy ", "new file", "deleted file", "old mode", "new mode", "Binary files", "GIT binary patch")
 
 
@@ -45,6 +48,20 @@ def add_to_lightest(workers: list[list[int]], extra: list[dict], seconds: dict[i
         workers[lightest].append(test["number"])
         loads[lightest] += test["seconds"]
         present.add(test["number"])
+
+
+def cheapest_split(tests: list[dict], extra: list[dict], seconds: dict[int, float]) -> list[list[int]]:
+    """The worker count, 1 to MAX_WORKERS, whose busiest worker plus per-worker overhead costs least."""
+    best, best_cost = [], None
+    for count in range(1, MAX_WORKERS + 1):
+        workers = [worker for worker in split(tests, count) if worker]
+        if workers and extra:
+            add_to_lightest(workers, extra, seconds)
+        busiest = max((sum(int(seconds[n] * 1000 + 0.5) for n in worker) for worker in workers), default=0)
+        cost = busiest + WORKER_OVERHEAD_MS * len(workers)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = workers, cost
+    return best
 
 
 def changes_source(text: str, coverage: dict) -> bool:
@@ -166,12 +183,51 @@ def is_blank_or_comment(text: str) -> bool:
     return not stripped or stripped.startswith("#")
 
 
-def tests_at(coverage: dict, path: str, number: int) -> list[int]:
+def quoted_keys(texts: list[str]) -> list[str]:
+    """Quoted strings on the changed lines that look like SQL words, e.g. the "ANTI" of a keyword table entry."""
+    return [key for text in texts for key in QUOTED.findall(text)
+            if re.search(r"[A-Za-z]", key) and not key.startswith(("%", " "))]
+
+
+def key_tests(coverage: dict, keys: list[str]) -> set[int]:
+    """Tests whose source, or a fixture they read, contains every word of one of the keys."""
+    found: set[int] = set()
+    for key in {key.upper() for key in keys}:
+        tests: set[int] | None = None
+        for word in WORD.findall(key):
+            value = coverage["word_tests"].get(word)
+            matching = set() if value is None else set(coverage["sets"][value])
+            tests = matching if tests is None else tests & matching
+        found |= tests or set()
+    return found
+
+
+def import_tests(coverage: dict, path: str, number: int, texts: list[str]) -> list[int] | set[int]:
+    """An import-time line affects whoever uses what it defines, which coverage cannot see.
+
+    A dialect file's line reaches its dialect, the dialects inheriting from it and the tests naming
+    them; a core table entry keyed by an upper-case SQL word reaches the tests using that word.
+    Anything else might affect every test.
+    """
+    family = coverage["families"].get(path)
+    if family is not None:
+        return coverage["sets"][family]
+    group = coverage["module_groups"].get(path)
+    if group is not None:
+        return coverage["sets"][group]
+    keys = quoted_keys(texts)
+    if any(key.upper() == key for key in keys):
+        own = coverage["file_tests"].get(path)
+        return (set() if own is None else set(coverage["sets"][own])) | key_tests(coverage, keys)
+    raise Unmapped(f"{path}:{number} runs at import time or outside a test")
+
+
+def tests_at(coverage: dict, path: str, number: int, texts: list[str]) -> list[int] | set[int]:
     value = coverage["files"][path].get(str(number))
     if value is None:
         raise Unmapped(f"{path}:{number} is not part of a statement")
     if value == IMPORT:
-        raise Unmapped(f"{path}:{number} runs at import time or outside a test")
+        return import_tests(coverage, path, number, texts)
     if value == MISSING:
         group = coverage.get("module_groups", {}).get(path)
         if group is not None:
@@ -212,11 +268,15 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
         lines = coverage["files"][path]
 
         for start, deleted, added in changed["blocks"]:
+            # A block that only touches comments and blank lines changes no behaviour.
+            if all(is_blank_or_comment(content) for _, content in deleted) and all(map(is_blank_or_comment, added)):
+                continue
+            texts = [content for _, content in deleted] + added
             deleted_code = False
             for number, content in deleted:
                 if str(number) not in lines and is_blank_or_comment(content):
                     continue
-                selected.update(tests_at(coverage, path, number))
+                selected.update(tests_at(coverage, path, number, texts))
                 deleted_code = True
 
             if not added or deleted_code:
@@ -231,15 +291,15 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
             if only_comments and lines.get(str(before)) == IMPORT and lines.get(str(after)) == IMPORT:
                 continue
             # New code runs where its neighbours run.
-            selected.update(tests_at(coverage, path, before))
-            selected.update(tests_at(coverage, path, after))
+            selected.update(tests_at(coverage, path, before, texts))
+            selected.update(tests_at(coverage, path, after, texts))
     return selected
 
 
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    every_test = split(tests, WORKERS)
     seconds = {test["number"]: test["seconds"] for test in tests}
+    every_test = cheapest_split(tests, [], seconds)
     try:
         coverage = json.loads(gzip.decompress(MAP_FILE.read_bytes()))
         by_id = {test["id"]: test for test in tests}
@@ -259,9 +319,7 @@ def main() -> None:
                 text = patch.read_text(encoding="utf-8", errors="replace")
                 chosen = tests_for_patch(text, coverage)
                 picked = sorted((known[i] for i in chosen if known[i] is not None), key=lambda t: t["number"])
-                workers = [worker for worker in split(picked, WORKERS) if worker]
-                if workers and changes_source(text, coverage):
-                    add_to_lightest(workers, unmapped, seconds)
+                workers = cheapest_split(picked, unmapped if changes_source(text, coverage) else [], seconds)
                 print(f"{patch.stem}: {sum(map(len, workers))} tests", file=sys.stderr)
             except Exception as reason:
                 print(f"{patch.stem}: every test ({reason})", file=sys.stderr)

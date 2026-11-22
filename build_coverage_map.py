@@ -34,6 +34,9 @@ DATA_FILE = "/tmp/blast-radius.coverage"
 READS_FILE = "/tmp/blast-radius-reads.json"
 MISSING, IMPORT = -1, -2
 PHASES = ("setup", "run", "teardown")
+# The package __init__.py files share no dialect, so they must not form a group of their own.
+GROUP_RE = re.compile(r"sqlglot/(dialects|parsers|generators|typing)/(?!__init__\.py)(\w+)\.py$")
+WORD = re.compile(r"[A-Z0-9_]+")
 
 # Data files under tests/ that were opened -> contexts that opened them, in pytest-cov's
 # "<test id>|<phase>" form, or "" when no test was running.
@@ -255,10 +258,9 @@ def build_map() -> None:
         return result
 
     # Module groups: dialect/parser/generator/typing files sharing a dialect name.
-    _GROUP_RE = re.compile(r"sqlglot/(dialects|parsers|generators|typing)/(\w+)\.py$")
     groups: dict[str, list[str]] = {}
     for path in files:
-        m = _GROUP_RE.match(path)
+        m = GROUP_RE.match(path)
         if m:
             groups.setdefault(m.group(2), []).append(path)
 
@@ -323,6 +325,91 @@ def build_map() -> None:
         print(f"fixture {relative}: {readers}", file=sys.stderr)
 
 
+def dialect_families() -> dict[str, set[str]]:
+    """Dialect name -> itself and every dialect whose class inherits from it."""
+    parent: dict[str, str | None] = {}
+    for path in (REPO / "sqlglot" / "dialects").glob("*.py"):
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.ClassDef) and node.name.lower() == path.stem:
+                bases = [b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for b in node.bases]
+                parent[path.stem] = next((b.lower() for b in bases if b.lower() != "dialect"), None)
+    families = {stem: {stem} for stem in parent}
+    for stem in parent:
+        ancestor = parent[stem]
+        while ancestor:
+            families.setdefault(ancestor, {ancestor}).add(stem)
+            ancestor = parent.get(ancestor)
+    return families
+
+
+def add_selection_tables() -> None:
+    """Add the tables the selector narrows import-time changes with, built from the map and the pinned tests.
+
+    "families": grouped dialect file -> tests of its dialect group, of the groups of dialects that
+    inherit from it, and of tests or fixtures naming any of those dialects.
+    "word_tests": upper-cased word -> tests whose own function source, or a fixture they read, contains it.
+    """
+    payload = json.loads(gzip.decompress(OUT.read_bytes()))
+    sets = payload["sets"]
+    set_index = {tuple(s): i for i, s in enumerate(sets)}
+
+    def set_number(tests: set[int]) -> int:
+        key = tuple(sorted(tests))
+        if key not in set_index:
+            set_index[key] = len(sets)
+            sets.append(list(key))
+        return set_index[key]
+
+    payload["module_groups"] = {p: g for p, g in payload["module_groups"].items() if GROUP_RE.match(p)}
+    payload["widen_to_group"] = {p: r for p, r in payload["widen_to_group"].items() if p in payload["module_groups"]}
+
+    index = {test_id: i for i, test_id in enumerate(payload["tests"])}
+    texts: dict[int, str] = {}
+    for file in sorted({test_id.split("::")[0] for test_id in payload["tests"]}):
+        source = (REPO / file).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        scopes = [("", tree.body)] + [(node.name + "::", node.body) for node in tree.body if isinstance(node, ast.ClassDef)]
+        for prefix, body in scopes:
+            for node in body:
+                test_id = f"{file}::{prefix}{node.name}" if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+                if test_id in index:
+                    texts[index[test_id]] = (ast.get_source_segment(source, node) or "").upper()
+    fixtures = [(set(WORD.findall((REPO / path).read_text(encoding="utf-8", errors="replace").upper())), set(sets[value]))
+                for path, value in payload["fixtures"].items() if value >= 0]
+
+    words: dict[str, set[int]] = {}
+    for test, text in texts.items():
+        for word in set(WORD.findall(text)):
+            words.setdefault(word, set()).add(test)
+    for fixture_words, readers in fixtures:
+        for word in fixture_words:
+            words.setdefault(word, set()).update(readers)
+    payload["word_tests"] = {word: set_number(tests) for word, tests in sorted(words.items())}
+
+    groups_by_name: dict[str, set[int]] = {}
+    for path, group in payload["module_groups"].items():
+        groups_by_name.setdefault(GROUP_RE.match(path).group(2), set()).update(sets[group])
+    families = dialect_families()
+    payload["families"] = {}
+    for path in payload["module_groups"]:
+        name = GROUP_RE.match(path).group(2)
+        if name == "dialect":
+            continue
+        found: set[int] = set()
+        for member in families.get(name, {name}):
+            found |= groups_by_name.get(member, set())
+            quoted = re.compile(r"[\"']" + re.escape(member.upper()) + r"[\"']")
+            found |= {test for test, text in texts.items() if quoted.search(text)}
+            for fixture_words, readers in fixtures:
+                if member.upper() in fixture_words:
+                    found |= readers
+        payload["families"][path] = set_number(found)
+
+    OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
+    print(f"words: {len(payload['word_tests'])}, families: {len(payload['families'])}, "
+          f"sets: {len(sets)}, size: {OUT.stat().st_size} bytes", file=sys.stderr)
+
+
 def write_sources() -> None:
     """The pinned commit's sqlglot/*.py, so the selector can compile a patched file without importing it."""
     sources = {
@@ -335,6 +422,8 @@ def write_sources() -> None:
 
 
 if __name__ == "__main__":
-    run_tests()
-    build_map()
+    if sys.argv[1:] != ["--tables"]:
+        run_tests()
+        build_map()
+    add_selection_tables()
     write_sources()
