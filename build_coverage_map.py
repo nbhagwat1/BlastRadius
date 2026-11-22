@@ -18,6 +18,7 @@ import gzip
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -218,7 +219,7 @@ def build_map() -> None:
                 else:
                     tests |= found
 
-            if outside_tests:
+            if outside_tests and not tests:
                 value = IMPORT
                 counts["import"] += 1
             elif not tests:
@@ -240,11 +241,50 @@ def build_map() -> None:
         else:
             fixtures[relative] = set_number(set().union(*found))
 
+    # Reverse lookups for building aggregate test sets.
+    test_list = sorted(test_index, key=test_index.__getitem__)
+    sets_by_id = {v: k for k, v in set_index.items()}
+
+    def tests_in_file(entries: dict[str, int]) -> set[str]:
+        result: set[str] = set()
+        for val in entries.values():
+            if val >= 0:
+                for idx in sets_by_id[val]:
+                    result.add(test_list[idx])
+        return result
+
+    # Module groups: dialect/parser/generator/typing files sharing a dialect name.
+    _GROUP_RE = re.compile(r"sqlglot/(dialects|parsers|generators|typing)/(\w+)\.py$")
+    groups: dict[str, list[str]] = {}
+    for path in files:
+        m = _GROUP_RE.match(path)
+        if m:
+            groups.setdefault(m.group(2), []).append(path)
+
+    module_groups: dict[str, int] = {}
+    for dialect, paths in groups.items():
+        all_tests: set[str] = set()
+        for path in paths:
+            all_tests |= tests_in_file(files[path])
+        if all_tests:
+            sn = set_number(all_tests)
+            for path in paths:
+                module_groups[path] = sn
+
+    # File-level test union: for each file, the set of all tests that run any line in it.
+    file_tests: dict[str, int] = {}
+    for path, entries in files.items():
+        ft = tests_in_file(entries)
+        if ft:
+            file_tests[path] = set_number(ft)
+
     payload = {
         "tests": sorted(test_index, key=test_index.__getitem__),
         "sets": [list(key) for key in sorted(set_index, key=set_index.__getitem__)],
         "files": files,
         "fixtures": fixtures,
+        "module_groups": module_groups,
+        "file_tests": file_tests,
     }
     OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
 

@@ -112,10 +112,14 @@ def tests_at(coverage: dict, path: str, number: int) -> list[int]:
     value = coverage["files"][path].get(str(number))
     if value is None:
         raise Unmapped(f"{path}:{number} is not part of a statement")
-    if value == MISSING:
-        raise Unmapped(f"{path}:{number} was never run by a test")
-    if value == IMPORT:
-        raise Unmapped(f"{path}:{number} runs at import time or outside a test")
+    if value in (MISSING, IMPORT):
+        group = coverage.get("module_groups", {}).get(path)
+        if group is not None:
+            return coverage["sets"][group]
+        fallback = coverage.get("file_tests", {}).get(path)
+        if fallback is not None:
+            return coverage["sets"][fallback]
+        raise Unmapped(f"{path}:{number} has no test coverage and no module group")
     return coverage["sets"][value]
 
 
