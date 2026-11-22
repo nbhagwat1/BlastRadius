@@ -406,6 +406,7 @@ def add_selection_tables() -> None:
         payload["families"][path] = set_number(found)
 
     payload["arg_flips"] = arg_flips(payload, set_number)
+    payload["attr_reads"] = attr_reads(payload, set_number)
 
     OUT.write_bytes(gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), mtime=0))
     print(f"arg_types spans: {sum(map(len, payload['arg_flips'].values()))}, "
@@ -469,6 +470,56 @@ def arg_flips(payload: dict, set_number) -> dict[str, list[list[int]]]:
             continue
         flips.setdefault(path, []).append([first, last, set_number(found)])
     return flips
+
+
+def attr_reads(payload: dict, set_number) -> dict[str, list[list[int]]]:
+    """Dialect file -> [first line, last line, tests] of each import-time assignment whose name is
+    only read by code that runs inside tests: the family's tests that run one of those reads.
+
+    Another class defining the same name is not a read. Any import-time read (a metaclass
+    deriving a table, a subclass extending it, code run while collecting) leaves the
+    assignment to its whole family.
+    """
+    sources = {p.relative_to(REPO).as_posix(): p.read_text(encoding="utf-8").split("\n")
+               for p in sorted((REPO / "sqlglot").rglob("*.py"))}
+    occurrences: dict[str, list[tuple[str, int]]] = {}
+    for path, lines in sources.items():
+        for number, line in enumerate(lines, 1):
+            for name in set(re.findall(r"\w+", line)):
+                occurrences.setdefault(name, []).append((path, number))
+
+    def tests_reading(name: str, own: str, first: int, last: int) -> set[int] | None:
+        definition = re.compile(r"^\s*" + re.escape(name) + r"\s*(:[^=]+)?=(?!=)(.*)$")
+        word = re.compile(r"\b" + re.escape(name) + r"\b")
+        found: set[int] = set()
+        for path, number in occurrences.get(name, ()):
+            line = sources[path][number - 1]
+            if (path == own and first <= number <= last) or not word.search(line):
+                continue
+            match = definition.match(line)
+            if match and not word.search(match.group(2)):
+                continue
+            value = payload["files"].get(path, {}).get(str(number))
+            if value == IMPORT:
+                return None
+            if value is not None and value >= 0:
+                found |= set(payload["sets"][value])
+        return found
+
+    spans: dict[str, list[list[int]]] = {}
+    for path, family in payload["families"].items():
+        lines = payload["files"].get(path, {})
+        for node in ast.walk(ast.parse("\n".join(sources[path]))):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or lines.get(str(node.lineno)) != IMPORT:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+            found = tests_reading(targets[0].id, path, node.lineno, node.end_lineno)
+            if found is not None:
+                tests = set(payload["sets"][family]) & found
+                spans.setdefault(path, []).append([node.lineno, node.end_lineno, set_number(tests)])
+    return spans
 
 
 def write_sources() -> None:

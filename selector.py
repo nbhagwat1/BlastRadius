@@ -239,6 +239,22 @@ def arg_flip_tests(coverage: dict, path: str, deleted: list, added: list) -> lis
     return None
 
 
+def attr_read_tests(coverage: dict, path: str, deleted: list, added: list) -> list[int] | None:
+    """Tests an in-place edit of one import-time assignment in a dialect file can affect; None for any other block."""
+    if not deleted or len(deleted) != len(added):
+        return None
+    lines = coverage["files"][path]
+    for first, last, tests in coverage.get("attr_reads", {}).get(path, ()):
+        if all(first <= number <= last and lines.get(str(number)) == IMPORT for number, _ in deleted):
+            for (number, old), new in zip(deleted, added):
+                if not same_layout(old, new):
+                    return None
+                if number == first and old.split("=")[0] != new.split("=")[0]:
+                    return None
+            return coverage["sets"][tests]
+    return None
+
+
 def same_comparison(old: str, new: str) -> bool:
     """`is None` <-> `== None` and `is X.MEMBER` -> `== X.MEMBER` (or the negated forms): the same test either way."""
     before = [re.sub(r"\s+", " ", token) for token in TOKEN.findall(old)]
@@ -295,13 +311,18 @@ def scope_effects(text: str) -> set | None:
     return effects
 
 
-def same_shape(old: str, new: str) -> bool:
-    """The replacement cannot move other lines into or out of a block or statement, nor change its function's scope."""
+def same_layout(old: str, new: str) -> bool:
+    """The replacement cannot move other lines into or out of a block or statement."""
     indent = lambda text: text[: len(text) - len(text.lstrip())]
     depth = lambda text: sum(text.count(c) for c in "([{") - sum(text.count(c) for c in ")]}")
     ending = lambda text: text.rstrip()[-1:] in (":", "\\")
-    if (indent(old) != indent(new) or depth(old) != depth(new) or ending(old) != ending(new)
-            or any(q in old + new for q in ('"""', "'''"))):
+    return (indent(old) == indent(new) and depth(old) == depth(new) and ending(old) == ending(new)
+            and not any(q in old + new for q in ('"""', "'''")))
+
+
+def same_shape(old: str, new: str) -> bool:
+    """Same layout, and the replacement cannot change its function's scope either."""
+    if not same_layout(old, new):
         return False
     effects = scope_effects(old)
     return effects is not None and effects == scope_effects(new)
@@ -368,6 +389,8 @@ def tests_for_patch(text: str, coverage: dict) -> tuple[set[int], bool]:
             ):
                 continue
             flipped = arg_flip_tests(coverage, path, deleted, added)
+            if flipped is None:
+                flipped = attr_read_tests(coverage, path, deleted, added)
             if flipped is not None:
                 selected.update(flipped)
                 import_time = True
