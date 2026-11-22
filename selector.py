@@ -221,8 +221,7 @@ def import_tests(coverage: dict, path: str, number: int, texts: list[str]) -> li
         return coverage["sets"][group]
     keys = quoted_keys(texts)
     if any(key.upper() == key for key in keys):
-        own = coverage["file_tests"].get(path)
-        return (set() if own is None else set(coverage["sets"][own])) | key_tests(coverage, keys)
+        return key_tests(coverage, keys)
     raise Unmapped(f"{path}:{number} runs at import time or outside a test")
 
 
