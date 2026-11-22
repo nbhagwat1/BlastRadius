@@ -19,6 +19,8 @@ MISSING, IMPORT = -1, -2
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 QUOTED = re.compile(r'"([^"\\]{2,})"')
 BOOL = re.compile(r"\b(True|False)\b")
+TOKEN = re.compile(r"\bis\s+not\b|\w+|==|!=|[^\w\s]")
+EQUALITY = {"is": "==", "is not": "!=", "==": "==", "!=": "!="}
 WORD = re.compile(r"[A-Z0-9_]+")
 OTHER_CHANGES = ("rename ", "copy ", "new file", "deleted file", "old mode", "new mode", "Binary files", "GIT binary patch")
 
@@ -236,6 +238,35 @@ def arg_flip_tests(coverage: dict, path: str, deleted: list, added: list) -> lis
     return None
 
 
+def same_comparison(old: str, new: str) -> bool:
+    """`is None` <-> `== None` and `is X.MEMBER` <-> `== X.MEMBER` (or the negated forms): the same test either way."""
+    before = [re.sub(r"\s+", " ", token) for token in TOKEN.findall(old)]
+    after = [re.sub(r"\s+", " ", token) for token in TOKEN.findall(new)]
+    if before == after or len(before) != len(after):
+        return False
+    for i, (a, b) in enumerate(zip(before, after)):
+        if a == b:
+            continue
+        if a not in EQUALITY or b not in EQUALITY or EQUALITY[a] != EQUALITY[b]:
+            return False
+        operand = before[i + 1 : i + 2]
+        j = i + 1
+        if operand == ["None"]:
+            j += 1
+        else:
+            # A dotted enum member: Name(.name)*.UPPER_CASE
+            if j >= len(before) or not before[j][:1].isupper():
+                return False
+            j += 1
+            while j + 1 < len(before) and before[j] == ".":
+                j += 2
+            if before[j - 2 : j - 1] != ["."] or not re.fullmatch(r"[A-Z][A-Z0-9_]*", before[j - 1]):
+                return False
+        if j < len(before) and before[j] in (".", "(", "["):
+            return False
+    return True
+
+
 def tests_at(coverage: dict, path: str, number: int, texts: list[str]) -> list[int] | set[int]:
     value = coverage["files"][path].get(str(number))
     if value is None:
@@ -259,13 +290,14 @@ def tests_at(coverage: dict, path: str, number: int, texts: list[str]) -> list[i
     return coverage["sets"][value]
 
 
-def tests_for_patch(text: str, coverage: dict) -> set[int]:
-    """Indexes into coverage["tests"] of every test that ran a changed base line."""
+def tests_for_patch(text: str, coverage: dict) -> tuple[set[int], bool]:
+    """Indexes into coverage["tests"] of every test that ran a changed base line, and whether any changed line runs at import time."""
     files = parse_patch(text)
     if not files:
         raise Unmapped("no files in patch")
 
     selected: set[int] = set()
+    import_time = False
     for changed in files:
         path = changed["new"]
         if changed["other"] or changed["old"] is None or changed["old"] != path:
@@ -285,15 +317,21 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
             # A block that only touches comments and blank lines changes no behaviour.
             if all(is_blank_or_comment(content) for _, content in deleted) and all(map(is_blank_or_comment, added)):
                 continue
+            if len(deleted) == len(added) and all(
+                content == new or same_comparison(content, new) for (_, content), new in zip(deleted, added)
+            ):
+                continue
             flipped = arg_flip_tests(coverage, path, deleted, added)
             if flipped is not None:
                 selected.update(flipped)
+                import_time = True
                 continue
             texts = [content for _, content in deleted] + added
             deleted_code = False
             for number, content in deleted:
                 if str(number) not in lines and is_blank_or_comment(content):
                     continue
+                import_time |= lines.get(str(number)) == IMPORT
                 selected.update(tests_at(coverage, path, number, texts))
                 deleted_code = True
 
@@ -309,9 +347,25 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
             if only_comments and lines.get(str(before)) == IMPORT and lines.get(str(after)) == IMPORT:
                 continue
             # New code runs where its neighbours run.
+            import_time |= IMPORT in (lines.get(str(before)), lines.get(str(after)))
             selected.update(tests_at(coverage, path, before, texts))
             selected.update(tests_at(coverage, path, after, texts))
-    return selected
+    return selected, import_time
+
+
+# Uncovered tests that only see what runs at import time: the module-level code a fresh
+# `import sqlglot` runs, sqlglotc/setup.py, and the typing modules' module-level metadata.
+IMPORT_ONLY_TESTS = {
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+    "tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions",
+    "tests/test_sqlglotc.py::TestSQLGlotC::test_dry_run_preserves_obsolete_extensions",
+    "tests/test_sqlglotc.py::TestSQLGlotC::test_editable_install_removes_obsolete_extensions",
+    "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",
+}
+
+
+def unmapped_for(unmapped: list[dict], import_time: bool) -> list[dict]:
+    return unmapped if import_time else [test for test in unmapped if test["id"] not in IMPORT_ONLY_TESTS]
 
 
 def main() -> None:
@@ -335,9 +389,10 @@ def main() -> None:
         if coverage is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
-                chosen = tests_for_patch(text, coverage)
+                chosen, import_time = tests_for_patch(text, coverage)
                 picked = sorted((known[i] for i in chosen if known[i] is not None), key=lambda t: t["number"])
-                workers = cheapest_split(picked, unmapped if changes_source(text, coverage) else [], seconds)
+                extra = unmapped_for(unmapped, import_time) if changes_source(text, coverage) else []
+                workers = cheapest_split(picked, extra, seconds)
                 print(f"{patch.stem}: {sum(map(len, workers))} tests", file=sys.stderr)
             except Exception as reason:
                 print(f"{patch.stem}: every test ({reason})", file=sys.stderr)
