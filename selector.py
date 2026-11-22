@@ -153,7 +153,11 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
             before, after = start - 1, start + len(deleted)
             # A comment or blank line outside any statement cannot change what runs.
             outside_statement = str(before) not in lines or str(after) not in lines
-            if outside_statement and all(is_blank_or_comment(line) for line in added):
+            only_comments = all(is_blank_or_comment(line) for line in added)
+            if outside_statement and only_comments:
+                continue
+            # Nor can one between two statements that only run at import time.
+            if only_comments and lines.get(str(before)) == IMPORT and lines.get(str(after)) == IMPORT:
                 continue
             # New code runs where its neighbours run.
             selected.update(tests_at(coverage, path, before))
