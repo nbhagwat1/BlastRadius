@@ -32,6 +32,23 @@ def split(tests: list[dict], worker_count: int) -> list[list[int]]:
     return workers
 
 
+def add_to_lightest(workers: list[list[int]], extra: list[dict], seconds: dict[int, float]) -> None:
+    """Longest first, each extra test onto the existing worker with the least to do."""
+    loads = [sum(seconds[number] for number in worker) for worker in workers]
+    present = {number for worker in workers for number in worker}
+    for test in sorted(extra, key=lambda test: test["seconds"], reverse=True):
+        if test["number"] in present:
+            continue
+        lightest = loads.index(min(loads))
+        workers[lightest].append(test["number"])
+        loads[lightest] += test["seconds"]
+        present.add(test["number"])
+
+
+def changes_source(text: str, coverage: dict) -> bool:
+    return any(changed["new"] in coverage["files"] for changed in parse_patch(text))
+
+
 def diff_path(text: str) -> str | None:
     path = text.split("\t")[0].strip()
     if path == "/dev/null":
@@ -172,10 +189,15 @@ def tests_for_patch(text: str, coverage: dict) -> set[int]:
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     every_test = split(tests, WORKERS)
+    seconds = {test["number"]: test["seconds"] for test in tests}
     try:
         coverage = json.loads(gzip.decompress(MAP_FILE.read_bytes()))
         by_id = {test["id"]: test for test in tests}
         known = [by_id.get(test_id) for test_id in coverage["tests"]]
+        # Tests that recorded no coverage: the map can never pick them, so any source change might break them.
+        mapped = set(coverage["tests"])
+        unmapped = [test for test in tests if test["id"] not in mapped]
+        print(f"{len(unmapped)} tests have no coverage", file=sys.stderr)
     except Exception as error:
         print(f"no coverage map ({error}); every commit runs every test", file=sys.stderr)
         coverage = None
@@ -184,10 +206,13 @@ def main() -> None:
         workers = every_test
         if coverage is not None:
             try:
-                chosen = tests_for_patch(patch.read_text(encoding="utf-8", errors="replace"), coverage)
+                text = patch.read_text(encoding="utf-8", errors="replace")
+                chosen = tests_for_patch(text, coverage)
                 picked = sorted((known[i] for i in chosen if known[i] is not None), key=lambda t: t["number"])
                 workers = [worker for worker in split(picked, WORKERS) if worker]
-                print(f"{patch.stem}: {len(picked)} tests", file=sys.stderr)
+                if workers and changes_source(text, coverage):
+                    add_to_lightest(workers, unmapped, seconds)
+                print(f"{patch.stem}: {sum(map(len, workers))} tests", file=sys.stderr)
             except Exception as reason:
                 print(f"{patch.stem}: every test ({reason})", file=sys.stderr)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
